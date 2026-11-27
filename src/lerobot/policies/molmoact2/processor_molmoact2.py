@@ -35,7 +35,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from lerobot.configs import FeatureType, PipelineFeatureType, PolicyFeature
+from lerobot.configs import FeatureType, NormalizationMode, PipelineFeatureType, PolicyFeature
 from lerobot.lerobot_types import EnvTransition, TransitionKey
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
@@ -684,9 +684,10 @@ class MolmoAct2MaskedUnnormalizerProcessorStep(_MolmoAct2MaskedNormalizationMixi
 @ProcessorStepRegistry.register(name="molmoact2_clamp_normalized")
 @dataclass
 class MolmoAct2ClampNormalizedProcessorStep(ProcessorStep):
-    """Clamp q01/q99-normalized state and action to the range used by the old trainer."""
+    """Clamp normalized state and, for bounded targets, actions to [-1, 1]."""
 
     normalization_masks: dict[str, list[bool]] | None = None
+    clamp_action: bool = True
 
     @staticmethod
     def _broadcast_feature_mask(mask: list[bool], tensor: Tensor) -> Tensor | None:
@@ -708,15 +709,13 @@ class MolmoAct2ClampNormalizedProcessorStep(ProcessorStep):
                 f"MolmoAct2 {key} gripper values are not under [-1, 1]. Please set normalize_gripper=True."
             )
 
-    def _clamp_tensor(self, tensor: Tensor, key: str) -> Tensor:
+    def _clamp_tensor(self, tensor: Tensor, key: str, *, clamp: bool = True) -> Tensor:
         mask = (self.normalization_masks or {}).get(key)
-        if mask is None:
-            return tensor.clamp(-1.0, 1.0)
-        tensor_mask = self._broadcast_feature_mask(mask, tensor)
+        tensor_mask = self._broadcast_feature_mask(mask, tensor) if mask is not None else None
         if tensor_mask is None:
-            return tensor.clamp(-1.0, 1.0)
+            return tensor.clamp(-1.0, 1.0) if clamp else tensor
         self._validate_masked_passthrough_range(tensor, tensor_mask, key)
-        return torch.where(tensor_mask, tensor.clamp(-1.0, 1.0), tensor)
+        return torch.where(tensor_mask, tensor.clamp(-1.0, 1.0), tensor) if clamp else tensor
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         transition = transition.copy()
@@ -727,7 +726,9 @@ class MolmoAct2ClampNormalizedProcessorStep(ProcessorStep):
             transition[TransitionKey.OBSERVATION] = observation
         action = transition.get(TransitionKey.ACTION)
         if action is not None:
-            transition[TransitionKey.ACTION] = self._clamp_tensor(torch.as_tensor(action), ACTION)
+            transition[TransitionKey.ACTION] = self._clamp_tensor(
+                torch.as_tensor(action), ACTION, clamp=self.clamp_action
+            )
         return transition
 
     def transform_features(
@@ -736,7 +737,7 @@ class MolmoAct2ClampNormalizedProcessorStep(ProcessorStep):
         return features
 
     def get_config(self) -> dict[str, Any]:
-        return {"normalization_masks": deepcopy(self.normalization_masks)}
+        return {"normalization_masks": deepcopy(self.normalization_masks), "clamp_action": self.clamp_action}
 
 
 @ProcessorStepRegistry.register(name="molmoact2_pack_inputs")
@@ -1154,17 +1155,43 @@ class MolmoAct2ActionFrameTransformStep(ProcessorStep):
 @ProcessorStepRegistry.register(name="molmoact2_clamp_action")
 @dataclass
 class MolmoAct2ClampActionProcessorStep(ProcessorStep):
+    clamp_action: bool = True
+    normalization_mask: list[bool] | None = None
+
     def __call__(self, transition: EnvTransition) -> EnvTransition:
-        transition = transition.copy()
         action = transition.get(TransitionKey.ACTION)
-        if action is not None:
-            transition[TransitionKey.ACTION] = torch.as_tensor(action).clamp(-1.0, 1.0)
-        return transition
+        if action is None:
+            return transition
+        action = torch.as_tensor(action)
+        clamped = action.clamp(-1.0, 1.0)
+        if not self.clamp_action:
+            if self.normalization_mask is None:
+                return transition
+            mask = MolmoAct2ClampNormalizedProcessorStep._broadcast_feature_mask(
+                self.normalization_mask, action
+            )
+            if mask is None:
+                return transition
+            # Pass through z-scores on normalized dimensions. Gripper commands retain their bound.
+            clamped = torch.where(mask, action, clamped)
+        return {**transition, TransitionKey.ACTION: clamped}
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
         return features
+
+    def get_config(self) -> dict[str, Any]:
+        return {"clamp_action": self.clamp_action, "normalization_mask": deepcopy(self.normalization_mask)}
+
+
+def _should_clamp_actions(
+    action_mode: str, norm_mode: NormalizationMode | None, stats: dict[str, dict[str, Any]] | None
+) -> bool:
+    # Only continuous z-scores can skip the legacy clamp. FAST still uses the bounded action format.
+    return (
+        action_mode != "continuous" or norm_mode != NormalizationMode.MEAN_STD or ACTION not in (stats or {})
+    )
 
 
 def _translate_pretrained_processor_overrides(
@@ -1260,7 +1287,7 @@ def make_molmoact2_pre_post_processors_from_pretrained(
             postprocessor_overrides,
         )
     )
-    return load_pretrained_policy_processors(
+    preprocessor, postprocessor = load_pretrained_policy_processors(
         pretrained_path,
         revision=revision,
         preprocessor_overrides=prepared_preprocessor_overrides,
@@ -1269,6 +1296,31 @@ def make_molmoact2_pre_post_processors_from_pretrained(
         postprocessor_config_filename=postprocessor_config_filename,
         trust_remote_code=config.trust_remote_code,
     )
+    pack = next(
+        (step for step in preprocessor.steps if isinstance(step, MolmoAct2PackInputsProcessorStep)), None
+    )
+    action_mode = pack.action_mode if pack is not None else config.action_mode
+    for pipeline, normalizer_type, clamp_type in (
+        (preprocessor, MolmoAct2MaskedNormalizerProcessorStep, MolmoAct2ClampNormalizedProcessorStep),
+        (postprocessor, MolmoAct2MaskedUnnormalizerProcessorStep, MolmoAct2ClampActionProcessorStep),
+    ):
+        # The loaded normalization step includes the saved or overridden normalization mode.
+        normalizer = next((step for step in pipeline.steps if isinstance(step, normalizer_type)), None)
+        if normalizer is not None:
+            for step in pipeline.steps:
+                if isinstance(step, clamp_type):
+                    step.clamp_action = _should_clamp_actions(
+                        action_mode, normalizer.norm_map.get(FeatureType.ACTION), normalizer.stats
+                    )
+                    if isinstance(step, MolmoAct2ClampActionProcessorStep):
+                        # Reloaded masks may be NumPy arrays after loading the processor state dict.
+                        raw_mask = (normalizer.stats or {}).get(ACTION, {}).get("mask")
+                        if raw_mask is not None:
+                            mask = torch.as_tensor(raw_mask, dtype=torch.bool)
+                            step.normalization_mask = mask.tolist() if mask.ndim == 1 else None
+                        else:
+                            step.normalization_mask = None
+    return preprocessor, postprocessor
 
 
 def make_molmoact2_pre_post_processors(
@@ -1314,6 +1366,9 @@ def make_molmoact2_pre_post_processors(
         dataset_feature_names=config.dataset_feature_names,
     )
     normalization_masks = _normalization_masks_from_stats(masked_dataset_stats)
+    clamp_action = _should_clamp_actions(
+        config.action_mode, config.normalization_mapping.get("ACTION"), masked_dataset_stats
+    )
     if config.device is None:
         raise ValueError(
             "MolmoAct2 processors require `config.device`; `PreTrainedConfig.__post_init__` resolves it."
@@ -1331,7 +1386,9 @@ def make_molmoact2_pre_post_processors(
             norm_map=config.normalization_mapping,
             stats=masked_dataset_stats,
         ),
-        MolmoAct2ClampNormalizedProcessorStep(normalization_masks=normalization_masks),
+        MolmoAct2ClampNormalizedProcessorStep(
+            normalization_masks=normalization_masks, clamp_action=clamp_action
+        ),
         MolmoAct2PackInputsProcessorStep(
             checkpoint_path=config.checkpoint_path,
             checkpoint_revision=config.checkpoint_revision,
@@ -1355,7 +1412,9 @@ def make_molmoact2_pre_post_processors(
     ]
 
     output_steps: list[ProcessorStep] = [
-        MolmoAct2ClampActionProcessorStep(),
+        MolmoAct2ClampActionProcessorStep(
+            clamp_action=clamp_action, normalization_mask=normalization_masks.get(ACTION)
+        ),
         MolmoAct2MaskedUnnormalizerProcessorStep(
             features=config.output_features,
             norm_map=config.normalization_mapping,
